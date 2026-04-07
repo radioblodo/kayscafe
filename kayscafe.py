@@ -2,6 +2,8 @@ import os
 import json
 import sqlite3
 import logging
+import asyncio
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -54,6 +56,7 @@ logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 PENDING_ADMIN_ACTIONS: dict[int, dict[str, Any]] = {}
+telegram_loop = asyncio.new_event_loop()
 
 
 # ============================================================
@@ -115,6 +118,16 @@ def init_db() -> None:
     conn.commit()
     seed_menu_items(conn)
     conn.close()
+
+
+def _run_telegram_loop() -> None:
+    asyncio.set_event_loop(telegram_loop)
+    telegram_loop.run_forever()
+
+
+def run_telegram_coroutine(coro):
+    future = asyncio.run_coroutine_threadsafe(coro, telegram_loop)
+    return future.result()
 
 
 
@@ -1103,13 +1116,7 @@ def telegram_webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
-
-        import asyncio
-
-        async def process_update() -> None:
-            await telegram_app.process_update(update)
-
-        asyncio.run(process_update())
+        run_telegram_coroutine(telegram_app.process_update(update))
         return jsonify({"ok": True})
     except Exception as exc:
         logger.exception("Webhook processing failed: %s", exc)
@@ -1138,9 +1145,8 @@ if not BOT_TOKEN:
     logger.warning("BOT_TOKEN is missing. Set it before deploying.")
 
 init_db()
-
-import asyncio
-asyncio.run(telegram_app.initialize())
+threading.Thread(target=_run_telegram_loop, daemon=True).start()
+run_telegram_coroutine(telegram_app.initialize())
 
 
 if __name__ == "__main__":
