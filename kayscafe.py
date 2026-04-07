@@ -1252,12 +1252,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data == "confirm_order":
         try:
-            order_id, receipt = create_order(user_id, customer_name)
+            order_id, _receipt = create_order(user_id, customer_name)
         except ValueError as exc:
             await query.answer(str(exc), show_alert=True)
             return
 
-        await query.edit_message_text(receipt, parse_mode="Markdown")
+        order = fetch_order(order_id)
+        await query.edit_message_text(
+            build_payment_pending_text(order_id, order["total_cents"]),
+            parse_mode="Markdown",
+        )
         try:
             await send_paynow_photo(query.message.chat_id, context)
         except Exception as exc:
@@ -1267,7 +1271,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             try:
                 await context.bot.send_message(
                     chat_id=admin_id,
-                    text=f"📥 *New Order Received*\n\n{receipt}",
+                    text=(
+                        "*New Order Awaiting Payment*\n\n"
+                        f"Order ID: `{order_id}`\n"
+                        f"Customer: {customer_name}\n"
+                        f"Telegram User ID: `{user_id}`\n"
+                        f"Total: {cents_to_money(order['total_cents'])}"
+                    ),
                     parse_mode="Markdown",
                 )
             except Exception as exc:
