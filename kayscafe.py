@@ -46,6 +46,12 @@ ADMIN_USER_IDS = {
     if x.strip()
 }
 DB_PATH = os.environ.get("DB_PATH", "/data/kayscafe.db")
+PAYNOW_IMAGE_URL = os.environ.get("PAYNOW_IMAGE_URL", "").strip()
+PAYNOW_IMAGE_PATH = os.environ.get("PAYNOW_IMAGE_PATH", "").strip()
+PAYNOW_CAPTION = os.environ.get(
+    "PAYNOW_CAPTION",
+    "Please complete payment via PayNow and send proof of payment.",
+).strip()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -597,6 +603,23 @@ def build_receipt(customer_name: str, order_id: int, items: list[dict[str, Any]]
     return "\n".join(lines)
 
 
+async def send_paynow_photo(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if PAYNOW_IMAGE_URL:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=PAYNOW_IMAGE_URL,
+            caption=PAYNOW_CAPTION,
+        )
+        return
+
+    if PAYNOW_IMAGE_PATH:
+        with open(PAYNOW_IMAGE_PATH, "rb") as image_file:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=image_file,
+                caption=PAYNOW_CAPTION,
+            )
+
 
 def create_order(user_id: int, customer_name: str) -> tuple[int, str]:
     rows = fetch_cart(user_id)
@@ -1087,6 +1110,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         await query.edit_message_text(receipt, parse_mode="Markdown")
+        try:
+            await send_paynow_photo(query.message.chat_id, context)
+        except Exception as exc:
+            logger.warning("Failed to send PayNow image to user %s: %s", user_id, exc)
 
         for admin_id in ADMIN_USER_IDS:
             try:
