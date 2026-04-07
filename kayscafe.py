@@ -151,6 +151,17 @@ def parse_order_items(items_json: str) -> list[dict[str, Any]]:
     return loaded if isinstance(loaded, list) else []
 
 
+def extract_payment_proof_file_id(message) -> str | None:
+    if message.photo:
+        return message.photo[-1].file_id
+
+    document = message.document
+    if document and document.mime_type and document.mime_type.startswith("image/"):
+        return document.file_id
+
+    return None
+
+
 
 def seed_menu_items(conn: sqlite3.Connection | None = None) -> None:
     owns_conn = conn is None
@@ -687,7 +698,7 @@ def fetch_latest_unpaid_order(user_id: int) -> dict[str, Any] | None:
     row = conn.execute(
         """
         SELECT * FROM orders
-        WHERE user_id = ? AND status IN ('awaiting_payment', 'payment_submitted')
+        WHERE user_id = ? AND status IN ('awaiting_payment', 'payment_submitted', 'payment_rejected')
         ORDER BY id DESC
         LIMIT 1
         """,
@@ -932,7 +943,11 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def handle_payment_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.photo:
+    if not update.message:
+        return
+
+    proof_file_id = extract_payment_proof_file_id(update.message)
+    if not proof_file_id:
         return
 
     user_id = update.effective_user.id
@@ -948,13 +963,19 @@ async def handle_payment_screenshot(update: Update, context: ContextTypes.DEFAUL
 
     update_order_status(order["id"], "payment_submitted")
     order = fetch_order(order["id"])
-    photo = update.message.photo[-1].file_id
+
+    if not ADMIN_USER_IDS:
+        logger.warning("Payment proof received for order %s but ADMIN_USER_IDS is empty.", order["id"])
+        await update.message.reply_text(
+            "Payment screenshot received, but admin notifications are not configured yet."
+        )
+        return
 
     for admin_id in ADMIN_USER_IDS:
         try:
             await context.bot.send_photo(
                 chat_id=admin_id,
-                photo=photo,
+                photo=proof_file_id,
                 caption=build_admin_payment_review_text(order),
                 parse_mode="Markdown",
                 reply_markup=build_payment_review_keyboard(order["id"]),
@@ -1384,6 +1405,9 @@ from telegram.ext import MessageHandler, filters
 telegram_app.add_handler(CallbackQueryHandler(button_handler))
 telegram_app.add_handler(CommandHandler("cancel", handle_admin_text))
 telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_payment_screenshot))
+telegram_app.add_handler(
+    MessageHandler(filters.Document.IMAGE & ~filters.COMMAND, handle_payment_screenshot)
+)
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
 if not BOT_TOKEN:
