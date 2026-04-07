@@ -146,6 +146,11 @@ def cents_to_money(cents: int) -> str:
     return f"${cents / 100:.2f}"
 
 
+def parse_order_items(items_json: str) -> list[dict[str, Any]]:
+    loaded = json.loads(items_json)
+    return loaded if isinstance(loaded, list) else []
+
+
 
 def seed_menu_items(conn: sqlite3.Connection | None = None) -> None:
     owns_conn = conn is None
@@ -649,7 +654,7 @@ def create_order(user_id: int, customer_name: str) -> tuple[int, str]:
     cur = conn.execute(
         """
         INSERT INTO orders (user_id, customer_name, items_json, total_cents, created_at, status)
-        VALUES (?, ?, ?, ?, ?, 'confirmed')
+        VALUES (?, ?, ?, ?, ?, 'awaiting_payment')
         """,
         (
             user_id,
@@ -665,6 +670,82 @@ def create_order(user_id: int, customer_name: str) -> tuple[int, str]:
 
     clear_cart(user_id)
     return order_id, build_receipt(customer_name, order_id, items, total_cents)
+
+
+def fetch_order(order_id: int) -> dict[str, Any] | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM orders WHERE id = ?",
+        (order_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def fetch_latest_unpaid_order(user_id: int) -> dict[str, Any] | None:
+    conn = get_conn()
+    row = conn.execute(
+        """
+        SELECT * FROM orders
+        WHERE user_id = ? AND status IN ('awaiting_payment', 'payment_submitted')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_order_status(order_id: int, status: str) -> bool:
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE orders SET status = ? WHERE id = ?",
+        (status, order_id),
+    )
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
+def build_payment_pending_text(order_id: int, total_cents: int) -> str:
+    return (
+        "Order created. Payment is pending.\n\n"
+        f"Order ID: `{order_id}`\n"
+        f"Total: {cents_to_money(total_cents)}\n\n"
+        "Please complete payment via PayNow, then send your payment screenshot here."
+    )
+
+
+def build_admin_payment_review_text(order: dict[str, Any]) -> str:
+    action_text = (
+        "Payment has been verified."
+        if order["status"] == "paid"
+        else (
+            "Payment proof was rejected. Customer has been asked to resend it."
+            if order["status"] == "payment_rejected"
+            else "Review the screenshot above and mark the order as paid when verified."
+        )
+    )
+    return (
+        "*Payment Proof Received*\n"
+        f"Order ID: `{order['id']}`\n"
+        f"Customer: {order['customer_name']}\n"
+        f"Telegram User ID: `{order['user_id']}`\n"
+        f"Total: {cents_to_money(order['total_cents'])}\n"
+        f"Status: {order['status']}\n\n"
+        f"{action_text}"
+    )
+
+
+def build_receipt_from_order(order: dict[str, Any]) -> str:
+    return build_receipt(
+        order["customer_name"],
+        order["id"],
+        parse_order_items(order["items_json"]),
+        order["total_cents"],
+    )
 
 
 # ============================================================
@@ -719,6 +800,15 @@ def build_cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("Clear Cart", callback_data="clear_cart")])
     rows.append([InlineKeyboardButton("Back to Main Menu", callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_payment_review_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Mark Paid", callback_data=f"admin_mark_paid:{order_id}"),
+            InlineKeyboardButton("Reject", callback_data=f"admin_reject_payment:{order_id}"),
+        ],
+    ])
 
 
 # ============================================================
@@ -841,6 +931,42 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 
+async def handle_payment_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.photo:
+        return
+
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        return
+
+    order = fetch_latest_unpaid_order(user_id)
+    if not order:
+        await update.message.reply_text(
+            "I could not find a pending order for this payment screenshot."
+        )
+        return
+
+    update_order_status(order["id"], "payment_submitted")
+    order = fetch_order(order["id"])
+    photo = update.message.photo[-1].file_id
+
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await context.bot.send_photo(
+                chat_id=admin_id,
+                photo=photo,
+                caption=build_admin_payment_review_text(order),
+                parse_mode="Markdown",
+                reply_markup=build_payment_review_keyboard(order["id"]),
+            )
+        except Exception as exc:
+            logger.warning("Failed to forward payment proof to admin %s: %s", admin_id, exc)
+
+    await update.message.reply_text(
+        "Payment screenshot received. Your order will be confirmed after an admin verifies it."
+    )
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -861,6 +987,76 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode="Markdown",
             reply_markup=build_admin_menu_keyboard(),
         )
+        return
+
+    if data.startswith("admin_mark_paid:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        order_id = int(data.split(":", 1)[1])
+        order = fetch_order(order_id)
+        if not order:
+            await query.answer("Order not found.", show_alert=True)
+            return
+        if order["status"] == "paid":
+            await query.answer("Order is already marked as paid.", show_alert=True)
+            return
+
+        update_order_status(order_id, "paid")
+        order = fetch_order(order_id)
+        receipt = build_receipt_from_order(order)
+
+        await query.edit_message_caption(
+            caption=build_admin_payment_review_text(order),
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+        await query.answer("Order marked as paid.")
+
+        try:
+            await context.bot.send_message(
+                chat_id=order["user_id"],
+                text=receipt,
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            logger.warning("Failed to send final confirmation for order %s: %s", order_id, exc)
+        return
+
+    if data.startswith("admin_reject_payment:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        order_id = int(data.split(":", 1)[1])
+        order = fetch_order(order_id)
+        if not order:
+            await query.answer("Order not found.", show_alert=True)
+            return
+        if order["status"] == "paid":
+            await query.answer("Order is already marked as paid.", show_alert=True)
+            return
+
+        update_order_status(order_id, "payment_rejected")
+        order = fetch_order(order_id)
+        await query.edit_message_caption(
+            caption=build_admin_payment_review_text(order),
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+        await query.answer("Payment proof rejected.")
+
+        try:
+            await context.bot.send_message(
+                chat_id=order["user_id"],
+                text=(
+                    "Your payment proof could not be verified yet.\n\n"
+                    f"Order ID: `{order_id}`\n"
+                    "Please resend a clearer payment screenshot."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            logger.warning("Failed to send rejection notice for order %s: %s", order_id, exc)
         return
 
     if data.startswith("admin_item:"):
@@ -1104,16 +1300,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data == "confirm_order":
         try:
-            order_id, receipt = create_order(user_id, customer_name)
+            order_id, _receipt = create_order(user_id, customer_name)
         except ValueError as exc:
             await query.answer(str(exc), show_alert=True)
             return
 
-        await query.edit_message_text(receipt, parse_mode="Markdown")
+        order = fetch_order(order_id)
+        await query.edit_message_text(
+            build_payment_pending_text(order_id, order["total_cents"]),
+            parse_mode="Markdown",
+        )
         try:
             await send_paynow_photo(query.message.chat_id, context)
         except Exception as exc:
             logger.warning("Failed to send PayNow image to user %s: %s", user_id, exc)
+
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "*New Order Awaiting Payment*\n\n"
+                        f"Order ID: `{order_id}`\n"
+                        f"Customer: {customer_name}\n"
+                        f"Telegram User ID: `{user_id}`\n"
+                        f"Total: {cents_to_money(order['total_cents'])}"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as exc:
+                logger.warning("Failed to notify admin %s: %s", admin_id, exc)
+        return
 
         for admin_id in ADMIN_USER_IDS:
             try:
@@ -1166,6 +1383,7 @@ from telegram.ext import MessageHandler, filters
 
 telegram_app.add_handler(CallbackQueryHandler(button_handler))
 telegram_app.add_handler(CommandHandler("cancel", handle_admin_text))
+telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_payment_screenshot))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
 if not BOT_TOKEN:
