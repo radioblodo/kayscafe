@@ -1,0 +1,4 @@
+python-telegram-bot==22.5
+Flask==3.0.3
+gunicorn==22.0.0
+google-cloud-firestore==2.21.0
