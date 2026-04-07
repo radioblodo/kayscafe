@@ -21,8 +21,7 @@ from telegram.ext import (
 # - Webhook mode for Railway
 # - Customer ordering flow
 # - Receipt-style order confirmation
-# - Admin-only commands to mark items sold out / available
-# - Admin-only commands to add, hide, and edit items
+# - Button-based admin actions for sold out, available, hide, remove, rename, price change, and add item
 # - SQLite database for menu, carts, and orders
 #
 # Environment variables:
@@ -54,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 flask_app = Flask(__name__)
 telegram_app = Application.builder().token(BOT_TOKEN).build()
+PENDING_ADMIN_ACTIONS: dict[int, dict[str, Any]] = {}
 
 
 # ============================================================
@@ -271,17 +271,45 @@ def hide_item(item_id: str) -> bool:
     return updated
 
 
-
-def add_item(item_id: str, category: str, name: str, price_cents: int, description: str) -> tuple[bool, str]:
+def unhide_item(item_id: str) -> bool:
     conn = get_conn()
-    existing = conn.execute(
-        "SELECT 1 FROM menu_items WHERE id = ?",
+    cur = conn.execute(
+        "UPDATE menu_items SET hidden = 0 WHERE id = ?",
         (item_id,),
-    ).fetchone()
-    if existing:
-        conn.close()
-        return False, "Item ID already exists."
+    )
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
 
+
+
+def slugify_item_id(name: str) -> str:
+    cleaned = []
+    for ch in name.lower():
+        if ch.isalnum():
+            cleaned.append(ch)
+        elif ch in {" ", "-", "/"}:
+            cleaned.append("_")
+    item_id = "".join(cleaned).strip("_")
+    while "__" in item_id:
+        item_id = item_id.replace("__", "_")
+    return item_id or "item"
+
+
+def generate_unique_item_id(name: str) -> str:
+    base = slugify_item_id(name)
+    candidate = base
+    counter = 2
+    while fetch_item(candidate):
+        candidate = f"{base}_{counter}"
+        counter += 1
+    return candidate
+
+
+def add_item(category: str, name: str, price_cents: int, description: str) -> tuple[bool, str, str | None]:
+    item_id = generate_unique_item_id(name)
+    conn = get_conn()
     conn.execute(
         """
         INSERT INTO menu_items (id, category, name, description, price_cents, available, hidden)
@@ -291,7 +319,7 @@ def add_item(item_id: str, category: str, name: str, price_cents: int, descripti
     )
     conn.commit()
     conn.close()
-    return True, "Item added successfully."
+    return True, "Item added successfully.", item_id
 
 
 
@@ -324,6 +352,20 @@ def edit_item(item_id: str, new_name: str | None = None, new_price_cents: int | 
     conn.commit()
     conn.close()
     return True, "Item updated successfully."
+
+
+def remove_item(item_id: str) -> tuple[bool, str]:
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM menu_items WHERE id = ?", (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return False, "Item not found."
+
+    conn.execute("DELETE FROM carts WHERE item_id = ?", (item_id,))
+    conn.execute("DELETE FROM menu_items WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+    return True, "Item removed successfully."
 
 
 
@@ -376,23 +418,27 @@ def build_admin_menu_keyboard() -> InlineKeyboardMarkup:
             )
         ])
 
+    rows.append([InlineKeyboardButton("➕ Add New Item", callback_data="admin_add_start")])
     rows.append([InlineKeyboardButton("Refresh Admin Menu", callback_data="admin_menu")])
     return InlineKeyboardMarkup(rows)
 
 
 
-def build_admin_item_keyboard(item_id: str) -> InlineKeyboardMarkup:
+def build_admin_item_keyboard(item_id: str, hidden: bool = False) -> InlineKeyboardMarkup:
+    hide_label = "Unhide Item" if hidden else "Hide Item"
+    hide_callback = f"admin_unhide:{item_id}" if hidden else f"admin_hide:{item_id}"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Mark Sold Out", callback_data=f"admin_soldout:{item_id}"),
             InlineKeyboardButton("Mark Available", callback_data=f"admin_available:{item_id}"),
         ],
         [
-            InlineKeyboardButton("Hide Item", callback_data=f"admin_hide:{item_id}"),
+            InlineKeyboardButton(hide_label, callback_data=hide_callback),
+            InlineKeyboardButton("Remove Item", callback_data=f"admin_remove_confirm:{item_id}"),
         ],
         [
-            InlineKeyboardButton("Rename Help", callback_data=f"admin_rename_help:{item_id}"),
-            InlineKeyboardButton("Price Help", callback_data=f"admin_price_help:{item_id}"),
+            InlineKeyboardButton("Rename Item", callback_data=f"admin_rename_start:{item_id}"),
+            InlineKeyboardButton("Change Price", callback_data=f"admin_price_start:{item_id}"),
         ],
         [InlineKeyboardButton("Back to Admin Menu", callback_data="admin_menu")],
     ])
@@ -405,12 +451,12 @@ def build_admin_item_text(item: dict[str, Any]) -> str:
         status += ", Hidden"
 
     return (
-        "*Admin Item Panel*"
-        f"*Name:* {item['name']}"
-        f"*Category:* {item['category']}"
-        f"*Price:* {cents_to_money(item['price_cents'])}"
-        f"*Status:* {status}"
-        f"*ID:* `{item['id']}`"
+        "*Admin Item Panel*\n"
+        f"*Name:* {item['name']}\n"
+        f"*Category:* {item['category']}\n"
+        f"*Price:* {cents_to_money(item['price_cents'])}\n"
+        f"*Status:* {status}\n"
+        f"*ID:* `{item['id']}`\n\n"
         "Choose an action below."
     )
 
@@ -681,123 +727,82 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def soldout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("You are not allowed to use this command.")
         return
 
-    if not context.args:
-        await update.message.reply_text("Usage: /soldout <item_id>")
+    pending = PENDING_ADMIN_ACTIONS.get(user_id)
+    if not pending or not update.message or not update.message.text:
         return
 
-    item_id = context.args[0].strip()
-    ok = set_item_availability(item_id, False)
-    if ok:
-        await update.message.reply_text(f"Item `{item_id}` is now marked as sold out.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Item ID not found.")
-
-
-async def available(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("You are not allowed to use this command.")
+    text = update.message.text.strip()
+    if text == "/cancel":
+        PENDING_ADMIN_ACTIONS.pop(user_id, None)
+        await update.message.reply_text("Admin action cancelled.")
         return
 
-    if not context.args:
-        await update.message.reply_text("Usage: /available <item_id>")
+    action = pending.get("action")
+
+    if action == "rename":
+        item_id = pending["item_id"]
+        ok, message = edit_item(item_id, new_name=text)
+        PENDING_ADMIN_ACTIONS.pop(user_id, None)
+        await update.message.reply_text(message)
         return
 
-    item_id = context.args[0].strip()
-    ok = set_item_availability(item_id, True)
-    if ok:
-        await update.message.reply_text(f"Item `{item_id}` is now available.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Item ID not found.")
-
-
-async def hideitem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("You are not allowed to use this command.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /hideitem <item_id>")
-        return
-
-    item_id = context.args[0].strip()
-    ok = hide_item(item_id)
-    if ok:
-        await update.message.reply_text(f"Item `{item_id}` is now hidden from customers.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Item ID not found.")
-
-
-async def additem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("You are not allowed to use this command.")
-        return
-
-    raw = update.message.text.replace("/additem", "", 1).strip()
-    parts = [p.strip() for p in raw.split("|")]
-
-    if len(parts) != 5:
-        await update.message.reply_text(
-            "Usage: /additem <item_id> | <category> | <name> | <price_cents> | <description>"
-        )
-        return
-
-    item_id, category, name, price_str, description = parts
-
-    try:
-        price_cents = int(price_str)
-        if price_cents < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("price_cents must be a non-negative integer.")
-        return
-
-    ok, message = add_item(item_id, category, name, price_cents, description)
-    await update.message.reply_text(message)
-
-
-async def edititem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("You are not allowed to use this command.")
-        return
-
-    raw = update.message.text.replace("/edititem", "", 1).strip()
-    parts = [p.strip() for p in raw.split("|")]
-
-    if len(parts) < 2 or len(parts) > 3:
-        await update.message.reply_text(
-            "Usage: /edititem <item_id> | <new_name> | <new_price_cents>\n"
-            "You can leave <new_name> empty if you only want to change the price."
-        )
-        return
-
-    item_id = parts[0]
-    new_name = None
-    new_price_cents = None
-
-    if len(parts) >= 2 and parts[1] != "":
-        new_name = parts[1]
-
-    if len(parts) == 3 and parts[2] != "":
+    if action == "price":
+        item_id = pending["item_id"]
         try:
-            new_price_cents = int(parts[2])
-            if new_price_cents < 0:
-                raise ValueError
+            dollars = float(text)
+            new_price_cents = int(round(dollars * 100))
         except ValueError:
-            await update.message.reply_text("new_price_cents must be a non-negative integer.")
+            await update.message.reply_text("Please enter a valid price like 6.50")
             return
+        ok, message = edit_item(item_id, new_price_cents=new_price_cents)
+        PENDING_ADMIN_ACTIONS.pop(user_id, None)
+        await update.message.reply_text(message)
+        return
 
-    ok, message = edit_item(item_id, new_name, new_price_cents)
-    await update.message.reply_text(message)
+    if action == "add_name":
+        pending["name"] = text
+        pending["action"] = "add_category"
+        await update.message.reply_text("Send the category for this new item, for example Drinks or Desserts.")
+        return
+
+    if action == "add_category":
+        pending["category"] = text
+        pending["action"] = "add_price"
+        await update.message.reply_text("Send the price, for example 6.50")
+        return
+
+    if action == "add_price":
+        try:
+            dollars = float(text)
+            pending["price_cents"] = int(round(dollars * 100))
+        except ValueError:
+            await update.message.reply_text("Please enter a valid price like 6.50")
+            return
+        pending["action"] = "add_description"
+        await update.message.reply_text("Send the item description.")
+        return
+
+    if action == "add_description":
+        ok, message, item_id = add_item(
+            pending["category"],
+            pending["name"],
+            pending["price_cents"],
+            text,
+        )
+        PENDING_ADMIN_ACTIONS.pop(user_id, None)
+        if ok:
+            await update.message.reply_text(f"{message} Created item: {pending['name']}")
+        else:
+            await update.message.reply_text(message)
+        return
+
+
+
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -834,7 +839,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(
             build_admin_item_text(item),
             parse_mode="Markdown",
-            reply_markup=build_admin_item_keyboard(item_id),
+            reply_markup=build_admin_item_keyboard(item_id, bool(item.get("hidden"))),
         )
         return
 
@@ -851,7 +856,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(
             build_admin_item_text(item),
             parse_mode="Markdown",
-            reply_markup=build_admin_item_keyboard(item_id),
+            reply_markup=build_admin_item_keyboard(item_id, bool(item.get("hidden"))),
         )
         await query.answer("Item marked as sold out.")
         return
@@ -869,7 +874,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(
             build_admin_item_text(item),
             parse_mode="Markdown",
-            reply_markup=build_admin_item_keyboard(item_id),
+            reply_markup=build_admin_item_keyboard(item_id, bool(item.get("hidden"))),
         )
         await query.answer("Item marked as available.")
         return
@@ -887,27 +892,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(
             build_admin_item_text(item),
             parse_mode="Markdown",
-            reply_markup=build_admin_item_keyboard(item_id),
+            reply_markup=build_admin_item_keyboard(item_id, True),
         )
         await query.answer("Item hidden from customers.")
         return
 
-    if data.startswith("admin_rename_help:"):
+    if data.startswith("admin_unhide:"):
         if not is_admin(user_id):
             await query.answer("You are not allowed to use this action.", show_alert=True)
             return
         item_id = data.split(":", 1)[1]
-        item = fetch_item(item_id)
-        if not item:
+        ok = unhide_item(item_id)
+        if not ok:
             await query.answer("Item not found.", show_alert=True)
             return
-        await query.message.reply_text(
-            f"Rename this item with: /edititem {item_id} | New Item Name | Current name: {item['name']}"
+        item = fetch_item(item_id)
+        await query.edit_message_text(
+            build_admin_item_text(item),
+            parse_mode="Markdown",
+            reply_markup=build_admin_item_keyboard(item_id, False),
         )
-        await query.answer("Rename instructions sent.")
+        await query.answer("Item is visible to customers again.")
         return
 
-    if data.startswith("admin_price_help:"):
+    if data == "admin_add_start":
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        PENDING_ADMIN_ACTIONS[user_id] = {"action": "add_name"}
+        await query.message.reply_text("Send the name of the new item.")
+        await query.answer("Add item started.")
+        return
+
+    if data.startswith("admin_rename_start:"):
         if not is_admin(user_id):
             await query.answer("You are not allowed to use this action.", show_alert=True)
             return
@@ -916,10 +933,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not item:
             await query.answer("Item not found.", show_alert=True)
             return
+        PENDING_ADMIN_ACTIONS[user_id] = {"action": "rename", "item_id": item_id}
+        await query.message.reply_text(f"Send the new name for {item['name']}.")
+        await query.answer("Rename started.")
+        return
+
+    if data.startswith("admin_price_start:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        item = fetch_item(item_id)
+        if not item:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        PENDING_ADMIN_ACTIONS[user_id] = {"action": "price", "item_id": item_id}
         await query.message.reply_text(
-            f"Change price with: /edititem {item_id} | | 650 Current price: {cents_to_money(item['price_cents'])} Use cents, so 650 means $6.50."
+            f"Send the new price for {item['name']}. Example: 6.50"
         )
-        await query.answer("Price instructions sent.")
+        await query.answer("Price change started.")
+        return
+
+    if data.startswith("admin_remove_confirm:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        item = fetch_item(item_id)
+        if not item:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Yes, Remove", callback_data=f"admin_remove_yes:{item_id}"),
+                InlineKeyboardButton("Cancel", callback_data=f"admin_item:{item_id}"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"Remove *{item['name']}* permanently?",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return
+
+    if data.startswith("admin_remove_yes:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        ok, message = remove_item(item_id)
+        await query.answer(message)
+        await query.edit_message_text(
+            list_all_items_for_admin(),
+            parse_mode="Markdown",
+            reply_markup=build_admin_menu_keyboard(),
+        )
         return
 
     if data == "main_menu":
@@ -1036,11 +1104,17 @@ def telegram_webhook():
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
 
-        telegram_loop.run_until_complete(telegram_app.process_update(update))
+        import asyncio
+
+        async def process_update() -> None:
+            await telegram_app.process_update(update)
+
+        asyncio.run(process_update())
         return jsonify({"ok": True})
     except Exception as exc:
         logger.exception("Webhook processing failed: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
+
 
 # ============================================================
 # STARTUP
@@ -1054,23 +1128,19 @@ telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("menu", menu))
 telegram_app.add_handler(CommandHandler("cart", cart))
 telegram_app.add_handler(CommandHandler("adminmenu", admin_menu))
-telegram_app.add_handler(CommandHandler("soldout", soldout))
-telegram_app.add_handler(CommandHandler("available", available))
-telegram_app.add_handler(CommandHandler("hideitem", hideitem))
-telegram_app.add_handler(CommandHandler("additem", additem))
-telegram_app.add_handler(CommandHandler("edititem", edititem))
+from telegram.ext import MessageHandler, filters
+
 telegram_app.add_handler(CallbackQueryHandler(button_handler))
+telegram_app.add_handler(CommandHandler("cancel", handle_admin_text))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
 if not BOT_TOKEN:
     logger.warning("BOT_TOKEN is missing. Set it before deploying.")
 
-import asyncio
-
 init_db()
 
-telegram_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(telegram_loop)
-telegram_loop.run_until_complete(telegram_app.initialize())
+import asyncio
+asyncio.run(telegram_app.initialize())
 
 
 if __name__ == "__main__":
@@ -1105,6 +1175,7 @@ if __name__ == "__main__":
 #    WEBHOOK_SECRET=<your secret>
 #    ADMIN_USER_IDS=1403094785,547731983
 #    DB_PATH=/data/kayscafe.db
+# 3. Admin uses /adminmenu and buttons instead of /edititem or /additem
 # 3. Generate a Railway domain
 # 4. Set Telegram webhook to:
 #    https://YOUR-RAILWAY-DOMAIN/webhook/YOUR_SECRET
