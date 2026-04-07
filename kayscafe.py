@@ -334,7 +334,7 @@ def list_all_items_for_admin() -> str:
     ).fetchall()
     conn.close()
 
-    lines = ["*Menu Item IDs*", "Use these IDs with /soldout or /available", ""]
+    lines = ["*Menu Items*", "Tap buttons in /adminmenu to manage items.", ""]
     current_category = None
     for row in rows:
         item = dict(row)
@@ -345,9 +345,74 @@ def list_all_items_for_admin() -> str:
         if item.get("hidden"):
             status += ", Hidden"
         lines.append(
-            f"- `{item['id']}` → {item['name']} ({cents_to_money(item['price_cents'])}) [{status}]"
+            f"- {item['name']} ({cents_to_money(item['price_cents'])}) [{status}]"
         )
-    return "\n".join(lines)
+    return "".join(lines)
+
+
+
+def fetch_admin_items() -> list[dict[str, Any]]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM menu_items ORDER BY category, name"
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+
+def build_admin_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    current_category = None
+    for item in fetch_admin_items():
+        if item["category"] != current_category:
+            current_category = item["category"]
+            rows.append([InlineKeyboardButton(f"— {current_category} —", callback_data="admin_noop")])
+        status_emoji = "🟢" if item["available"] and not item.get("hidden") else "🔴"
+        rows.append([
+            InlineKeyboardButton(
+                f"{status_emoji} {item['name']}",
+                callback_data=f"admin_item:{item['id']}",
+            )
+        ])
+
+    rows.append([InlineKeyboardButton("Refresh Admin Menu", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+
+def build_admin_item_keyboard(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Mark Sold Out", callback_data=f"admin_soldout:{item_id}"),
+            InlineKeyboardButton("Mark Available", callback_data=f"admin_available:{item_id}"),
+        ],
+        [
+            InlineKeyboardButton("Hide Item", callback_data=f"admin_hide:{item_id}"),
+        ],
+        [
+            InlineKeyboardButton("Rename Help", callback_data=f"admin_rename_help:{item_id}"),
+            InlineKeyboardButton("Price Help", callback_data=f"admin_price_help:{item_id}"),
+        ],
+        [InlineKeyboardButton("Back to Admin Menu", callback_data="admin_menu")],
+    ])
+
+
+
+def build_admin_item_text(item: dict[str, Any]) -> str:
+    status = "Available" if item["available"] else "Sold Out"
+    if item.get("hidden"):
+        status += ", Hidden"
+
+    return (
+        "*Admin Item Panel*"
+        f"*Name:* {item['name']}"
+        f"*Category:* {item['category']}"
+        f"*Price:* {cents_to_money(item['price_cents'])}"
+        f"*Status:* {status}"
+        f"*ID:* `{item['id']}`"
+        "Choose an action below."
+    )
 
 
 
@@ -609,7 +674,11 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("You are not allowed to use this command.")
         return
 
-    await update.message.reply_text(list_all_items_for_admin(), parse_mode="Markdown")
+    await update.message.reply_text(
+        list_all_items_for_admin(),
+        parse_mode="Markdown",
+        reply_markup=build_admin_menu_keyboard(),
+    )
 
 
 async def soldout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -739,6 +808,120 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     customer_name = query.from_user.full_name or "Customer"
     data = query.data
 
+    if data == "admin_noop":
+        return
+
+    if data == "admin_menu":
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        await query.edit_message_text(
+            list_all_items_for_admin(),
+            parse_mode="Markdown",
+            reply_markup=build_admin_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("admin_item:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        item = fetch_item(item_id)
+        if not item:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        await query.edit_message_text(
+            build_admin_item_text(item),
+            parse_mode="Markdown",
+            reply_markup=build_admin_item_keyboard(item_id),
+        )
+        return
+
+    if data.startswith("admin_soldout:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        ok = set_item_availability(item_id, False)
+        if not ok:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        item = fetch_item(item_id)
+        await query.edit_message_text(
+            build_admin_item_text(item),
+            parse_mode="Markdown",
+            reply_markup=build_admin_item_keyboard(item_id),
+        )
+        await query.answer("Item marked as sold out.")
+        return
+
+    if data.startswith("admin_available:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        ok = set_item_availability(item_id, True)
+        if not ok:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        item = fetch_item(item_id)
+        await query.edit_message_text(
+            build_admin_item_text(item),
+            parse_mode="Markdown",
+            reply_markup=build_admin_item_keyboard(item_id),
+        )
+        await query.answer("Item marked as available.")
+        return
+
+    if data.startswith("admin_hide:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        ok = hide_item(item_id)
+        if not ok:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        item = fetch_item(item_id)
+        await query.edit_message_text(
+            build_admin_item_text(item),
+            parse_mode="Markdown",
+            reply_markup=build_admin_item_keyboard(item_id),
+        )
+        await query.answer("Item hidden from customers.")
+        return
+
+    if data.startswith("admin_rename_help:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        item = fetch_item(item_id)
+        if not item:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        await query.message.reply_text(
+            f"Rename this item with: /edititem {item_id} | New Item Name | Current name: {item['name']}"
+        )
+        await query.answer("Rename instructions sent.")
+        return
+
+    if data.startswith("admin_price_help:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        item = fetch_item(item_id)
+        if not item:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        await query.message.reply_text(
+            f"Change price with: /edititem {item_id} | | 650 Current price: {cents_to_money(item['price_cents'])} Use cents, so 650 means $6.50."
+        )
+        await query.answer("Price instructions sent.")
+        return
+
     if data == "main_menu":
         await query.edit_message_text(
             "Please choose a category or view your cart.",
@@ -853,7 +1036,12 @@ def telegram_webhook():
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
 
-        telegram_loop.run_until_complete(telegram_app.process_update(update))
+        import asyncio
+
+        async def process_update() -> None:
+            await telegram_app.process_update(update)
+
+        asyncio.run(process_update())
         return jsonify({"ok": True})
     except Exception as exc:
         logger.exception("Webhook processing failed: %s", exc)
@@ -882,13 +1070,10 @@ telegram_app.add_handler(CallbackQueryHandler(button_handler))
 if not BOT_TOKEN:
     logger.warning("BOT_TOKEN is missing. Set it before deploying.")
 
-import asyncio
-
 init_db()
 
-telegram_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(telegram_loop)
-telegram_loop.run_until_complete(telegram_app.initialize())
+import asyncio
+asyncio.run(telegram_app.initialize())
 
 
 if __name__ == "__main__":
