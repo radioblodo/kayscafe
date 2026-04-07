@@ -1036,17 +1036,11 @@ def telegram_webhook():
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
 
-        import asyncio
-
-        async def process_update() -> None:
-            await telegram_app.process_update(update)
-
-        asyncio.run(process_update())
+        telegram_loop.run_until_complete(telegram_app.process_update(update))
         return jsonify({"ok": True})
     except Exception as exc:
         logger.exception("Webhook processing failed: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
-
 
 # ============================================================
 # STARTUP
@@ -1070,10 +1064,13 @@ telegram_app.add_handler(CallbackQueryHandler(button_handler))
 if not BOT_TOKEN:
     logger.warning("BOT_TOKEN is missing. Set it before deploying.")
 
+import asyncio
+
 init_db()
 
-import asyncio
-asyncio.run(telegram_app.initialize())
+telegram_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(telegram_loop)
+telegram_loop.run_until_complete(telegram_app.initialize())
 
 
 if __name__ == "__main__":
