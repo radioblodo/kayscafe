@@ -55,8 +55,8 @@ PAYNOW_CAPTION = os.environ.get(
     "PAYNOW_CAPTION",
     "Please complete payment via PayNow and send proof of payment.",
 ).strip()
-# For dynamic QR: set PAYNOW_PROXY_TYPE to "0" (UEN) or "2" (mobile number)
-# and PAYNOW_PROXY to your UEN or phone number (e.g. +6591234567)
+# For dynamic QR: set PAYNOW_PROXY_TYPE to "0" (mobile number) or "2" (UEN)
+# and PAYNOW_PROXY to your phone number (e.g. +6591234567) or UEN
 PAYNOW_PROXY_TYPE = os.environ.get("PAYNOW_PROXY_TYPE", "").strip()
 PAYNOW_PROXY = os.environ.get("PAYNOW_PROXY", "").strip()
 PAYNOW_NAME = os.environ.get("PAYNOW_NAME", "Kay's Cafe").strip()
@@ -714,7 +714,7 @@ def generate_paynow_qr_image(amount_cents: int) -> BytesIO:
         _tlv("00", "SG.PAYNOW")
         + _tlv("01", PAYNOW_PROXY_TYPE)
         + _tlv("02", PAYNOW_PROXY)
-        + _tlv("03", "1")  # amount not editable
+        + _tlv("03", "0")  # amount not editable (fixed)
     )
     name = PAYNOW_NAME[:25]
     payload = (
