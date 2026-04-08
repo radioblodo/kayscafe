@@ -732,7 +732,7 @@ def build_admin_payment_review_text(order: dict[str, Any]) -> str:
         f"Customer: {_escape_md(order['customer_name'])}\n"
         f"Telegram User ID: `{order['user_id']}`\n"
         f"Total: {cents_to_money(order['total_cents'])}\n"
-        f"Status: {order['status']}\n\n"
+        f"Status: {_escape_md(order['status'])}\n\n"
         "Review the screenshot above and mark the order as paid when verified."
     )
 
