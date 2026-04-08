@@ -111,6 +111,18 @@ def init_db() -> None:
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('shop_open', '1')"
+    )
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS carts (
             user_id INTEGER NOT NULL,
             item_id TEXT NOT NULL,
@@ -346,6 +358,23 @@ def set_item_max_quantity(item_id: str, max_quantity: int | None) -> bool:
     return updated
 
 
+def get_shop_open() -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM settings WHERE key = 'shop_open'").fetchone()
+    conn.close()
+    return row is None or row["value"] == "1"
+
+
+def set_shop_open(open: bool) -> None:
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('shop_open', ?)",
+        ("1" if open else "0",),
+    )
+    conn.commit()
+    conn.close()
+
+
 def slugify_item_id(name: str) -> str:
     cleaned = []
     for ch in name.lower():
@@ -480,7 +509,10 @@ def build_admin_menu_keyboard() -> InlineKeyboardMarkup:
             )
         ])
 
+    shop_open = get_shop_open()
+    shop_label = "🟢 Shop: Open — Close Shop" if shop_open else "🔴 Shop: Closed — Open Shop"
     rows.append([InlineKeyboardButton("➕ Add New Item", callback_data="admin_add_start")])
+    rows.append([InlineKeyboardButton(shop_label, callback_data="admin_toggle_shop")])
     rows.append([InlineKeyboardButton("Refresh Admin Menu", callback_data="admin_menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -1202,6 +1234,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.warning("Failed to notify customer of rejection for order %s: %s", order_id, exc)
         return
 
+    if data == "admin_toggle_shop":
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        new_state = not get_shop_open()
+        set_shop_open(new_state)
+        status_text = "open" if new_state else "closed"
+        await query.answer(f"Shop is now {status_text}.")
+        await query.edit_message_text(
+            list_all_items_for_admin(),
+            parse_mode="Markdown",
+            reply_markup=build_admin_menu_keyboard(),
+        )
+        return
+
     if data.startswith("admin_item:"):
         if not is_admin(user_id):
             await query.answer("You are not allowed to use this action.", show_alert=True)
@@ -1397,7 +1444,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines = [f"*{category}*"]
 
         for item in items:
-            status = "Available" if item["available"] else "Sold Out"
+            if not item["available"]:
+                status = "Sold Out"
+            elif item.get("max_quantity") is not None and count_ordered_quantity(item["id"]) >= item["max_quantity"]:
+                status = "Fully Booked"
+            else:
+                status = "Available"
             lines.append(
                 f"\n*{item['name']}*\n{item['description']}\n{cents_to_money(item['price_cents'])} · {status}"
             )
@@ -1469,6 +1521,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if data == "confirm_order":
+        if not get_shop_open():
+            await query.answer("Sorry, the shop is currently closed. Please come back later!", show_alert=True)
+            return
         try:
             order_id, _receipt = create_order(user_id, customer_name)
         except ValueError as exc:
