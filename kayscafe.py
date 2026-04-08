@@ -903,7 +903,10 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     for category in fetch_categories():
         rows.append([InlineKeyboardButton(f"View {category}", callback_data=f"category:{category}")])
     rows.append([InlineKeyboardButton("View Cart", callback_data="view_cart")])
-    rows.append([InlineKeyboardButton("Confirm Order", callback_data="confirm_order")])
+    if get_shop_open():
+        rows.append([InlineKeyboardButton("Confirm Order", callback_data="confirm_order")])
+    else:
+        rows.append([InlineKeyboardButton("🔴 Shop is Closed", callback_data="shop_closed")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -945,7 +948,10 @@ def build_cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"➕ {row['name']}", callback_data=f"add:{row['item_id']}"),
         ])
 
-    rows.append([InlineKeyboardButton("Confirm Order", callback_data="confirm_order")])
+    if get_shop_open():
+        rows.append([InlineKeyboardButton("Confirm Order", callback_data="confirm_order")])
+    else:
+        rows.append([InlineKeyboardButton("🔴 Shop is Closed", callback_data="shop_closed")])
     rows.append([InlineKeyboardButton("Clear Cart", callback_data="clear_cart")])
     rows.append([InlineKeyboardButton("Back to Main Menu", callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
@@ -1520,9 +1526,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if data == "shop_closed":
+        await query.edit_message_text(
+            "The shop is currently closed. Please check back later!",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+
     if data == "confirm_order":
         if not get_shop_open():
-            await query.answer("Sorry, the shop is currently closed. Please come back later!", show_alert=True)
+            await query.edit_message_text(
+                "The shop is currently closed. Please check back later!",
+                reply_markup=build_main_menu_keyboard(),
+            )
             return
         try:
             order_id, _receipt = create_order(user_id, customer_name)
