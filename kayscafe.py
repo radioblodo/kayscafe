@@ -321,6 +321,19 @@ def unhide_item(item_id: str) -> bool:
 
 
 
+def count_ordered_quantity(item_id: str) -> int:
+    """Return the total units of item_id across all existing orders."""
+    conn = get_conn()
+    rows = conn.execute("SELECT items_json FROM orders").fetchall()
+    conn.close()
+    total = 0
+    for row in rows:
+        for entry in parse_order_items(row["items_json"]):
+            if entry.get("item_id") == item_id:
+                total += entry.get("quantity", 0)
+    return total
+
+
 def set_item_max_quantity(item_id: str, max_quantity: int | None) -> bool:
     conn = get_conn()
     cur = conn.execute(
@@ -529,9 +542,14 @@ def add_to_cart(user_id: int, item_id: str) -> None:
 
     current_qty = int(existing["quantity"]) if existing else 0
     max_qty = item.get("max_quantity")
-    if max_qty is not None and current_qty >= max_qty:
-        conn.close()
-        raise ValueError(f"You can only order up to {max_qty} of this item.")
+    if max_qty is not None:
+        already_ordered = count_ordered_quantity(item_id)
+        if already_ordered + current_qty >= max_qty:
+            conn.close()
+            remaining = max_qty - already_ordered
+            if remaining <= 0:
+                raise ValueError(f"Sorry, {item['name']} is fully booked.")
+            raise ValueError(f"You can only add {remaining} more of {item['name']}.")
 
     if existing:
         conn.execute(
@@ -723,6 +741,16 @@ def create_order(user_id: int, customer_name: str) -> tuple[int, str]:
     unavailable = [row["name"] for row in rows if not row["available"]]
     if unavailable:
         raise ValueError("These items are sold out: " + ", ".join(unavailable))
+
+    exceeded = []
+    for row in rows:
+        max_qty = fetch_item(row["item_id"]).get("max_quantity")
+        if max_qty is not None:
+            already_ordered = count_ordered_quantity(row["item_id"])
+            if already_ordered + row["quantity"] > max_qty:
+                exceeded.append(row["name"])
+    if exceeded:
+        raise ValueError("Quantity limit exceeded for: " + ", ".join(exceeded))
 
     items = []
     total_cents = 0
