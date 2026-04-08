@@ -924,8 +924,6 @@ async def handle_payment_screenshot(update: Update, context: ContextTypes.DEFAUL
         return
 
     user_id = update.effective_user.id
-    if is_admin(user_id):
-        return
 
     order = fetch_latest_unpaid_order(user_id)
     if not order:
