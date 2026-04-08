@@ -580,7 +580,7 @@ def add_to_cart(user_id: int, item_id: str) -> None:
             conn.close()
             remaining = max_qty - already_ordered
             if remaining <= 0:
-                raise ValueError(f"Sorry, {item['name']} is fully booked.")
+                raise ValueError(f"Sorry, {item['name']} is sold out.")
             raise ValueError(f"You can only add {remaining} more of {item['name']}.")
 
     if existing:
@@ -921,9 +921,8 @@ def build_category_keyboard(category: str) -> InlineKeyboardMarkup:
             max_qty is not None and count_ordered_quantity(item["id"]) >= max_qty
         )
         if not item["available"] or fully_booked:
-            label = f"{item['name']} - {'Fully Booked' if fully_booked else 'Sold Out'}"
             rows.append([
-                InlineKeyboardButton(label, callback_data="fully_booked" if fully_booked else "sold_out")
+                InlineKeyboardButton(f"{item['name']} - Sold Out", callback_data="sold_out")
             ])
         else:
             rows.append([
@@ -1453,7 +1452,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not item["available"]:
                 status = "Sold Out"
             elif item.get("max_quantity") is not None and count_ordered_quantity(item["id"]) >= item["max_quantity"]:
-                status = "Fully Booked"
+                status = "Sold Out"
             else:
                 status = "Available"
             lines.append(
@@ -1471,9 +1470,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Sorry, this item is currently sold out.", show_alert=True)
         return
 
-    if data == "fully_booked":
-        await query.answer("Sorry, this item is fully booked for today.", show_alert=True)
-        return
 
     if data.startswith("add:"):
         item_id = data.split(":", 1)[1]
