@@ -881,18 +881,20 @@ def build_category_keyboard(category: str) -> InlineKeyboardMarkup:
     items = fetch_items_by_category(category)
 
     for item in items:
-        if item["available"]:
+        max_qty = item.get("max_quantity")
+        fully_booked = (
+            max_qty is not None and count_ordered_quantity(item["id"]) >= max_qty
+        )
+        if not item["available"] or fully_booked:
+            label = f"{item['name']} - {'Fully Booked' if fully_booked else 'Sold Out'}"
             rows.append([
-                InlineKeyboardButton(
-                    f"Add {item['name']} ({cents_to_money(item['price_cents'])})",
-                    callback_data=f"add:{item['id']}",
-                )
+                InlineKeyboardButton(label, callback_data="fully_booked" if fully_booked else "sold_out")
             ])
         else:
             rows.append([
                 InlineKeyboardButton(
-                    f"{item['name']} - Sold Out",
-                    callback_data="sold_out",
+                    f"Add {item['name']} ({cents_to_money(item['price_cents'])})",
+                    callback_data=f"add:{item['id']}",
                 )
             ])
 
@@ -1409,6 +1411,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data == "sold_out":
         await query.answer("Sorry, this item is currently sold out.", show_alert=True)
+        return
+
+    if data == "fully_booked":
+        await query.answer("Sorry, this item is fully booked for today.", show_alert=True)
         return
 
     if data.startswith("add:"):
