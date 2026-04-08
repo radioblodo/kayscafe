@@ -5,7 +5,10 @@ import logging
 import asyncio
 import threading
 from datetime import datetime, timezone
+from io import BytesIO
 from typing import Any
+
+import qrcode
 
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -52,6 +55,11 @@ PAYNOW_CAPTION = os.environ.get(
     "PAYNOW_CAPTION",
     "Please complete payment via PayNow and send proof of payment.",
 ).strip()
+# For dynamic QR: set PAYNOW_PROXY_TYPE to "0" (UEN) or "2" (mobile number)
+# and PAYNOW_PROXY to your UEN or phone number (e.g. +6591234567)
+PAYNOW_PROXY_TYPE = os.environ.get("PAYNOW_PROXY_TYPE", "").strip()
+PAYNOW_PROXY = os.environ.get("PAYNOW_PROXY", "").strip()
+PAYNOW_NAME = os.environ.get("PAYNOW_NAME", "Kay's Cafe").strip()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -608,7 +616,60 @@ def build_receipt(customer_name: str, order_id: int, items: list[dict[str, Any]]
     return "\n".join(lines)
 
 
-async def send_paynow_photo(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _crc16(data: str) -> int:
+    crc = 0xFFFF
+    for byte in data.encode("utf-8"):
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else (crc << 1)
+            crc &= 0xFFFF
+    return crc
+
+
+def _tlv(tag: str, value: str) -> str:
+    return f"{tag}{len(value):02d}{value}"
+
+
+def generate_paynow_qr_image(amount_cents: int) -> BytesIO:
+    amount_str = f"{amount_cents / 100:.2f}"
+    merchant_account = (
+        _tlv("00", "SG.PAYNOW")
+        + _tlv("01", PAYNOW_PROXY_TYPE)
+        + _tlv("02", PAYNOW_PROXY)
+        + _tlv("03", "1")  # amount not editable
+    )
+    name = PAYNOW_NAME[:25]
+    payload = (
+        _tlv("00", "01")
+        + _tlv("01", "12")
+        + _tlv("26", merchant_account)
+        + _tlv("52", "0000")
+        + _tlv("53", "702")
+        + _tlv("54", amount_str)
+        + _tlv("58", "SG")
+        + _tlv("59", name)
+        + _tlv("60", "Singapore")
+        + "6304"
+    )
+    crc = _crc16(payload)
+    qr_string = payload + f"{crc:04X}"
+    img = qrcode.make(qr_string)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+async def send_paynow_photo(chat_id: int, context: ContextTypes.DEFAULT_TYPE, total_cents: int = 0) -> None:
+    if PAYNOW_PROXY and PAYNOW_PROXY_TYPE and total_cents:
+        buf = generate_paynow_qr_image(total_cents)
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=buf,
+            caption=PAYNOW_CAPTION,
+        )
+        return
+
     if PAYNOW_IMAGE_URL:
         await context.bot.send_photo(
             chat_id=chat_id,
@@ -1314,7 +1375,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode="Markdown",
         )
         try:
-            await send_paynow_photo(query.message.chat_id, context)
+            await send_paynow_photo(query.message.chat_id, context, total_cents=order["total_cents"])
         except Exception as exc:
             logger.warning("Failed to send PayNow image to user %s: %s", user_id, exc)
 
