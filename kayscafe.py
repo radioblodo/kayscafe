@@ -795,7 +795,10 @@ def build_cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 def build_payment_review_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Mark Paid", callback_data=f"admin_mark_paid:{order_id}")],
+        [
+            InlineKeyboardButton("Mark Paid", callback_data=f"admin_mark_paid:{order_id}"),
+            InlineKeyboardButton("Reject", callback_data=f"admin_reject_payment:{order_id}"),
+        ],
     ])
 
 
@@ -936,6 +939,7 @@ async def handle_payment_screenshot(update: Update, context: ContextTypes.DEFAUL
     order = fetch_order(order["id"])
     photo = update.message.photo[-1].file_id
 
+    notified = False
     for admin_id in ADMIN_USER_IDS:
         try:
             await context.bot.send_photo(
@@ -945,12 +949,18 @@ async def handle_payment_screenshot(update: Update, context: ContextTypes.DEFAUL
                 parse_mode="Markdown",
                 reply_markup=build_payment_review_keyboard(order["id"]),
             )
+            notified = True
         except Exception as exc:
             logger.warning("Failed to forward payment proof to admin %s: %s", admin_id, exc)
 
-    await update.message.reply_text(
-        "Payment screenshot received. Your order will be confirmed after an admin verifies it."
-    )
+    if not notified:
+        await update.message.reply_text(
+            "Warning: could not reach any admin to review your payment. Please contact us directly."
+        )
+    else:
+        await update.message.reply_text(
+            "Payment screenshot received. Your order will be confirmed after an admin verifies it."
+        )
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1007,6 +1017,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         except Exception as exc:
             logger.warning("Failed to send final confirmation for order %s: %s", order_id, exc)
+        return
+
+    if data.startswith("admin_reject_payment:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        order_id = int(data.split(":", 1)[1])
+        order = fetch_order(order_id)
+        if not order:
+            await query.answer("Order not found.", show_alert=True)
+            return
+        if order["status"] == "paid":
+            await query.answer("Order is already marked as paid.", show_alert=True)
+            return
+
+        update_order_status(order_id, "awaiting_payment")
+        order = fetch_order(order_id)
+
+        await query.edit_message_caption(
+            caption=build_admin_payment_review_text(order),
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+        await query.answer("Payment rejected.")
+
+        try:
+            await context.bot.send_message(
+                chat_id=order["user_id"],
+                text=(
+                    "Your payment screenshot could not be verified for Order #"
+                    f"{order_id}. Please send a clear screenshot of your PayNow transfer, "
+                    "or contact us for help."
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Failed to notify customer of rejection for order %s: %s", order_id, exc)
         return
 
     if data.startswith("admin_item:"):
