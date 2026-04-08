@@ -99,10 +99,15 @@ def init_db() -> None:
             description TEXT NOT NULL,
             price_cents INTEGER NOT NULL,
             available INTEGER NOT NULL DEFAULT 1,
-            hidden INTEGER NOT NULL DEFAULT 0
+            hidden INTEGER NOT NULL DEFAULT 0,
+            max_quantity INTEGER DEFAULT NULL
         )
         """
     )
+    # Migrate existing DBs that don't have max_quantity yet
+    existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(menu_items)").fetchall()}
+    if "max_quantity" not in existing_cols:
+        cur.execute("ALTER TABLE menu_items ADD COLUMN max_quantity INTEGER DEFAULT NULL")
 
     cur.execute(
         """
@@ -316,6 +321,18 @@ def unhide_item(item_id: str) -> bool:
 
 
 
+def set_item_max_quantity(item_id: str, max_quantity: int | None) -> bool:
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE menu_items SET max_quantity = ? WHERE id = ?",
+        (max_quantity, item_id),
+    )
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
 def slugify_item_id(name: str) -> str:
     cleaned = []
     for ch in name.lower():
@@ -472,6 +489,7 @@ def build_admin_item_keyboard(item_id: str, hidden: bool = False) -> InlineKeybo
             InlineKeyboardButton("Rename Item", callback_data=f"admin_rename_start:{item_id}"),
             InlineKeyboardButton("Change Price", callback_data=f"admin_price_start:{item_id}"),
         ],
+        [InlineKeyboardButton("Set Max Qty", callback_data=f"admin_maxqty_start:{item_id}")],
         [InlineKeyboardButton("Back to Admin Menu", callback_data="admin_menu")],
     ])
 
@@ -482,12 +500,16 @@ def build_admin_item_text(item: dict[str, Any]) -> str:
     if item.get("hidden"):
         status += ", Hidden"
 
+    max_qty = item.get("max_quantity")
+    max_qty_str = str(max_qty) if max_qty is not None else "Unlimited"
+
     return (
         "*Admin Item Panel*\n"
         f"*Name:* {item['name']}\n"
         f"*Category:* {item['category']}\n"
         f"*Price:* {cents_to_money(item['price_cents'])}\n"
         f"*Status:* {status}\n"
+        f"*Max Qty per order:* {max_qty_str}\n"
         f"*ID:* `{item['id']}`\n\n"
         "Choose an action below."
     )
@@ -504,6 +526,12 @@ def add_to_cart(user_id: int, item_id: str) -> None:
         "SELECT quantity FROM carts WHERE user_id = ? AND item_id = ?",
         (user_id, item_id),
     ).fetchone()
+
+    current_qty = int(existing["quantity"]) if existing else 0
+    max_qty = item.get("max_quantity")
+    if max_qty is not None and current_qty >= max_qty:
+        conn.close()
+        raise ValueError(f"You can only order up to {max_qty} of this item.")
 
     if existing:
         conn.execute(
@@ -949,6 +977,27 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(message)
         return
 
+    if action == "max_qty":
+        item_id = pending["item_id"]
+        if text.lower() in {"0", "none", "unlimited", "no limit"}:
+            set_item_max_quantity(item_id, None)
+            PENDING_ADMIN_ACTIONS.pop(user_id, None)
+            await update.message.reply_text("Max quantity removed (unlimited).")
+        else:
+            try:
+                max_qty = int(text)
+                if max_qty < 1:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text(
+                    "Please enter a whole number (e.g. 3), or 0 / 'unlimited' to remove the limit."
+                )
+                return
+            set_item_max_quantity(item_id, max_qty)
+            PENDING_ADMIN_ACTIONS.pop(user_id, None)
+            await update.message.reply_text(f"Max quantity set to {max_qty}.")
+        return
+
     if action == "add_name":
         pending["name"] = text
         pending["action"] = "add_category"
@@ -1250,6 +1299,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Price change started.")
         return
 
+    if data.startswith("admin_maxqty_start:"):
+        if not is_admin(user_id):
+            await query.answer("You are not allowed to use this action.", show_alert=True)
+            return
+        item_id = data.split(":", 1)[1]
+        item = fetch_item(item_id)
+        if not item:
+            await query.answer("Item not found.", show_alert=True)
+            return
+        PENDING_ADMIN_ACTIONS[user_id] = {"action": "max_qty", "item_id": item_id}
+        current = item.get("max_quantity")
+        current_str = str(current) if current is not None else "unlimited"
+        await query.message.reply_text(
+            f"Send the max quantity per order for {item['name']} (currently {current_str}).\n"
+            "Enter a number (e.g. 3), or 0 / 'unlimited' to remove the limit."
+        )
+        await query.answer("Set max quantity started.")
+        return
+
     if data.startswith("admin_remove_confirm:"):
         if not is_admin(user_id):
             await query.answer("You are not allowed to use this action.", show_alert=True)
@@ -1325,7 +1393,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("This item is sold out.", show_alert=True)
             return
 
-        add_to_cart(user_id, item_id)
+        try:
+            add_to_cart(user_id, item_id)
+        except ValueError as e:
+            await query.answer(str(e), show_alert=True)
+            return
         summary, _ = cart_summary_text(user_id)
         await query.edit_message_text(
             summary,
