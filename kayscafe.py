@@ -718,11 +718,18 @@ def build_payment_pending_text(order_id: int, total_cents: int) -> str:
     )
 
 
+def _escape_md(text: str) -> str:
+    """Escape special characters for Telegram legacy Markdown."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def build_admin_payment_review_text(order: dict[str, Any]) -> str:
     return (
         "*Payment Proof Received*\n"
         f"Order ID: `{order['id']}`\n"
-        f"Customer: {order['customer_name']}\n"
+        f"Customer: {_escape_md(order['customer_name'])}\n"
         f"Telegram User ID: `{order['user_id']}`\n"
         f"Total: {cents_to_money(order['total_cents'])}\n"
         f"Status: {order['status']}\n\n"
