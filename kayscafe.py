@@ -927,7 +927,7 @@ def build_category_keyboard(category: str) -> InlineKeyboardMarkup:
         else:
             rows.append([
                 InlineKeyboardButton(
-                    f"Add {item['name']} ({cents_to_money(item['price_cents'])})",
+                    item['name'],
                     callback_data=f"add:{item['id']}",
                 )
             ])
