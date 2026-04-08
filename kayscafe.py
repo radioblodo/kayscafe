@@ -1325,6 +1325,7 @@ from telegram.ext import MessageHandler, filters
 telegram_app.add_handler(CallbackQueryHandler(button_handler))
 telegram_app.add_handler(CommandHandler("cancel", handle_admin_text))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
+telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_payment_screenshot))
 
 if not BOT_TOKEN:
     logger.warning("BOT_TOKEN is missing. Set it before deploying.")
